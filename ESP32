@@ -1,0 +1,2987 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include <time.h>
+
+// ============================================================
+// WIFI SETTINGS
+// ============================================================
+
+const char* WIFI_SSID = "arjun";
+const char* WIFI_PASSWORD = "123456789";
+
+
+// ============================================================
+// WEB SERVER
+// ============================================================
+
+WebServer server(80);
+
+
+// ============================================================
+// OLED
+// ============================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+
+// ============================================================
+// PARKING SLOT IR SENSORS
+// ============================================================
+
+#define SLOT1_IR 25
+#define SLOT2_IR 26
+#define SLOT3_IR 27
+#define SLOT4_IR 32
+
+
+// ============================================================
+// GATE IR SENSORS
+// ============================================================
+
+#define GATE_IN_IR 33
+#define GATE_OUT_IR 34
+
+
+// ============================================================
+// SERVO
+// ============================================================
+
+#define SERVO_PIN 13
+
+Servo gateServo;
+
+const int GATE_CLOSED = 0;
+const int GATE_OPEN = 90;
+
+
+// ============================================================
+// PARKING VARIABLES
+// ============================================================
+
+bool slot1Occupied = false;
+bool slot2Occupied = false;
+bool slot3Occupied = false;
+bool slot4Occupied = false;
+
+bool vehicleEntering = false;
+bool vehicleExiting = false;
+
+bool gateIsOpen = false;
+
+int occupiedSlots = 0;
+int availableSlots = 4;
+
+
+// ============================================================
+// GATE TIMER
+// ============================================================
+
+unsigned long gateTimer = 0;
+
+const unsigned long GATE_DELAY = 3000;
+
+
+// ============================================================
+// EVENT DETECTION
+// ============================================================
+
+bool previousEntryState = false;
+bool previousExitState = false;
+
+
+// ============================================================
+// VEHICLE HISTORY
+// ============================================================
+
+#define MAX_HISTORY 10
+
+struct VehicleRecord {
+
+  String vehicleID;
+
+  String type;
+
+  String date;
+
+  String time;
+
+  String slot;
+
+  String duration;
+};
+
+VehicleRecord history[MAX_HISTORY];
+
+int historyCount = 0;
+
+int vehicleNumber = 1;
+
+
+// ============================================================
+// ACTIVE VEHICLES
+// ============================================================
+
+struct ActiveVehicle {
+
+  String vehicleID;
+
+  String slot;
+
+  unsigned long entryMillis;
+
+  bool active;
+};
+
+ActiveVehicle activeVehicles[4];
+
+
+// ============================================================
+// NTP TIME
+// ============================================================
+
+const char* NTP_SERVER = "pool.ntp.org";
+
+const long GMT_OFFSET_SEC = 19800;
+
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
+// Wi-Fi
+void connectToWiFi();
+
+
+// Time
+void initializeTime();
+String getCurrentDate();
+String getCurrentTime();
+
+
+// Sensors
+void readSensors();
+
+
+// Gate
+void openGate();
+void closeGate();
+void controlGate();
+
+
+// OLED
+void updateOLED();
+
+
+// Serial
+void printSystemStatus();
+
+
+// Vehicle events
+void processVehicleEvents();
+
+
+// History
+void addHistory(String type, String slot);
+String getAvailableSlot();
+String getHistoryJSON();
+
+
+// Active vehicles
+int findActiveVehicle(String slot);
+void registerVehicleEntry(String slot);
+void registerVehicleExit();
+
+
+// Web server
+void handleDashboard();
+void handleStatus();
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("      SMART PARKING SYSTEM");
+  Serial.println("================================");
+
+
+  // ==========================================================
+  // IR SENSOR SETUP
+  // ==========================================================
+
+  pinMode(SLOT1_IR, INPUT);
+  pinMode(SLOT2_IR, INPUT);
+  pinMode(SLOT3_IR, INPUT);
+  pinMode(SLOT4_IR, INPUT);
+
+  pinMode(GATE_IN_IR, INPUT);
+  pinMode(GATE_OUT_IR, INPUT);
+
+
+  // ==========================================================
+  // OLED SETUP
+  // ==========================================================
+
+  Wire.begin(21, 22);
+
+  if (!display.begin(
+        SSD1306_SWITCHCAPVCC,
+        0x3C
+      )) {
+
+    Serial.println("OLED NOT FOUND");
+
+    while (true);
+  }
+
+
+  // ==========================================================
+  // SERVO SETUP
+  // ==========================================================
+
+  gateServo.setPeriodHertz(50);
+
+  gateServo.attach(
+    SERVO_PIN,
+    500,
+    2400
+  );
+
+  gateServo.write(GATE_CLOSED);
+
+
+  // ==========================================================
+  // WIFI
+  // ==========================================================
+
+  connectToWiFi();
+
+
+  // ==========================================================
+  // REAL TIME
+  // ==========================================================
+
+  initializeTime();
+
+
+  // ==========================================================
+  // WEB SERVER
+  // ==========================================================
+
+  server.on("/", handleDashboard);
+
+  server.on("/api/status", handleStatus);
+
+  server.begin();
+
+  Serial.println("Web server started");
+
+
+  // ==========================================================
+  // OLED STARTUP SCREEN
+  // ==========================================================
+
+  display.clearDisplay();
+
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(2);
+
+  display.setCursor(10, 8);
+
+  display.println("SMART");
+
+  display.setCursor(10, 34);
+
+  display.println("PARKING");
+
+  display.display();
+
+  delay(2000);
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  readSensors();
+
+  processVehicleEvents();
+
+  controlGate();
+
+  updateOLED();
+
+  server.handleClient();
+
+
+  // Serial status every 2 seconds
+
+  static unsigned long lastPrint = 0;
+
+  if (millis() - lastPrint >= 2000) {
+
+    lastPrint = millis();
+
+    printSystemStatus();
+  }
+
+
+  delay(50);
+}
+// ============================================================
+// WIFI CONNECTION
+// ============================================================
+
+void connectToWiFi() {
+
+  Serial.println();
+  Serial.println("Connecting to Wi-Fi...");
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  int attempts = 0;
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    attempts < 30
+  ) {
+
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    Serial.println();
+    Serial.println("Wi-Fi connected");
+
+    Serial.print("Network: ");
+    Serial.println(WIFI_SSID);
+
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+
+  }
+
+  else {
+
+    Serial.println();
+    Serial.println("Wi-Fi connection failed");
+
+  }
+}
+
+
+// ============================================================
+// NTP TIME INITIALIZATION
+// ============================================================
+
+void initializeTime() {
+
+  configTime(
+    GMT_OFFSET_SEC,
+    DAYLIGHT_OFFSET_SEC,
+    NTP_SERVER
+  );
+
+  Serial.println();
+  Serial.println("Synchronizing time...");
+
+  struct tm timeInfo;
+
+  if (getLocalTime(&timeInfo)) {
+
+    Serial.println("Time synchronized");
+
+    Serial.print("Date: ");
+
+    Serial.printf(
+      "%02d-%02d-%04d\n",
+      timeInfo.tm_mday,
+      timeInfo.tm_mon + 1,
+      timeInfo.tm_year + 1900
+    );
+
+    Serial.print("Time: ");
+
+    Serial.printf(
+      "%02d:%02d:%02d\n",
+      timeInfo.tm_hour,
+      timeInfo.tm_min,
+      timeInfo.tm_sec
+    );
+
+  }
+
+  else {
+
+    Serial.println("Time synchronization failed");
+
+  }
+}
+
+
+// ============================================================
+// GET CURRENT DATE
+// ============================================================
+
+String getCurrentDate() {
+
+  struct tm timeInfo;
+
+  if (!getLocalTime(&timeInfo)) {
+
+    return "--";
+  }
+
+  char dateBuffer[12];
+
+  sprintf(
+    dateBuffer,
+    "%02d-%02d-%04d",
+    timeInfo.tm_mday,
+    timeInfo.tm_mon + 1,
+    timeInfo.tm_year + 1900
+  );
+
+  return String(dateBuffer);
+}
+
+
+// ============================================================
+// GET CURRENT TIME
+// ============================================================
+
+String getCurrentTime() {
+
+  struct tm timeInfo;
+
+  if (!getLocalTime(&timeInfo)) {
+
+    return "--:--:--";
+  }
+
+  char timeBuffer[10];
+
+  sprintf(
+    timeBuffer,
+    "%02d:%02d:%02d",
+    timeInfo.tm_hour,
+    timeInfo.tm_min,
+    timeInfo.tm_sec
+  );
+
+  return String(timeBuffer);
+}
+// ============================================================
+// READ ALL SENSORS
+// ============================================================
+
+void readSensors() {
+
+  // ==========================================================
+  // PARKING SLOT SENSORS
+  // LOW  = VEHICLE PRESENT
+  // HIGH = SLOT FREE
+  // ==========================================================
+
+  slot1Occupied =
+    (digitalRead(SLOT1_IR) == LOW);
+
+  slot2Occupied =
+    (digitalRead(SLOT2_IR) == LOW);
+
+  slot3Occupied =
+    (digitalRead(SLOT3_IR) == LOW);
+
+  slot4Occupied =
+    (digitalRead(SLOT4_IR) == LOW);
+
+
+  // ==========================================================
+  // COUNT OCCUPIED SLOTS
+  // ==========================================================
+
+  occupiedSlots = 0;
+
+  if (slot1Occupied) {
+
+    occupiedSlots++;
+
+  }
+
+  if (slot2Occupied) {
+
+    occupiedSlots++;
+
+  }
+
+  if (slot3Occupied) {
+
+    occupiedSlots++;
+
+  }
+
+  if (slot4Occupied) {
+
+    occupiedSlots++;
+
+  }
+
+
+  // ==========================================================
+  // AVAILABLE SLOTS
+  // ==========================================================
+
+  availableSlots =
+    4 - occupiedSlots;
+
+
+  // ==========================================================
+  // ENTRY GATE SENSOR
+  // ==========================================================
+
+  vehicleEntering =
+    (digitalRead(GATE_IN_IR) == LOW);
+
+
+  // ==========================================================
+  // EXIT GATE SENSOR
+  // ==========================================================
+
+  vehicleExiting =
+    (digitalRead(GATE_OUT_IR) == LOW);
+}
+// ============================================================
+// OPEN GATE
+// ============================================================
+
+void openGate() {
+
+  if (!gateIsOpen) {
+
+    gateServo.write(GATE_OPEN);
+
+    gateIsOpen = true;
+
+    Serial.println("GATE OPEN");
+  }
+
+  // Reset closing timer
+  gateTimer = millis();
+}
+
+
+// ============================================================
+// CLOSE GATE
+// ============================================================
+
+void closeGate() {
+
+  if (gateIsOpen) {
+
+    gateServo.write(GATE_CLOSED);
+
+    gateIsOpen = false;
+
+    Serial.println("GATE CLOSED");
+  }
+}
+
+
+// ============================================================
+// GATE CONTROL
+// ============================================================
+
+void controlGate() {
+
+  // ==========================================================
+  // VEHICLE ENTERING
+  // ==========================================================
+  // Entry is allowed only when a parking slot is available.
+
+  if (vehicleEntering &&
+      availableSlots > 0) {
+
+    openGate();
+
+    Serial.println("ENTRY VEHICLE DETECTED");
+
+    Serial.print("Available Slots: ");
+
+    Serial.println(availableSlots);
+  }
+
+
+  // ==========================================================
+  // VEHICLE EXITING
+  // ==========================================================
+  // Exit is ALWAYS allowed, even when parking is full.
+
+  if (vehicleExiting) {
+
+    openGate();
+
+    Serial.println("EXIT VEHICLE DETECTED");
+  }
+
+
+  // ==========================================================
+  // KEEP GATE OPEN WHILE VEHICLE IS DETECTED
+  // ==========================================================
+
+  if (gateIsOpen) {
+
+    if (vehicleEntering ||
+        vehicleExiting) {
+
+      gateTimer = millis();
+    }
+  }
+
+
+  // ==========================================================
+  // AUTOMATIC GATE CLOSING
+  // ==========================================================
+
+  if (gateIsOpen &&
+      !vehicleEntering &&
+      !vehicleExiting &&
+      millis() - gateTimer >= GATE_DELAY) {
+
+    closeGate();
+  }
+}
+// ============================================================
+// OLED DISPLAY
+// ============================================================
+
+void updateOLED() {
+
+  display.clearDisplay();
+
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+
+
+  // ==========================================================
+  // TITLE
+  // ==========================================================
+
+  display.setCursor(25, 0);
+
+  display.println("SMART PARKING");
+
+  display.drawLine(
+    0,
+    10,
+    127,
+    10,
+    SSD1306_WHITE
+  );
+
+
+  // ==========================================================
+  // SLOT 1
+  // ==========================================================
+
+  display.setCursor(0, 17);
+
+  display.print("S1: ");
+
+  if (slot1Occupied) {
+
+    display.print("OCC");
+
+  } else {
+
+    display.print("FREE");
+  }
+
+
+  // ==========================================================
+  // SLOT 2
+  // ==========================================================
+
+  display.setCursor(65, 17);
+
+  display.print("S2: ");
+
+  if (slot2Occupied) {
+
+    display.print("OCC");
+
+  } else {
+
+    display.print("FREE");
+  }
+
+
+  // ==========================================================
+  // SLOT 3
+  // ==========================================================
+
+  display.setCursor(0, 30);
+
+  display.print("S3: ");
+
+  if (slot3Occupied) {
+
+    display.print("OCC");
+
+  } else {
+
+    display.print("FREE");
+  }
+
+
+  // ==========================================================
+  // SLOT 4
+  // ==========================================================
+
+  display.setCursor(65, 30);
+
+  display.print("S4: ");
+
+  if (slot4Occupied) {
+
+    display.print("OCC");
+
+  } else {
+
+    display.print("FREE");
+  }
+
+
+  // ==========================================================
+  // AVAILABLE SLOTS
+  // ==========================================================
+
+  display.setCursor(0, 43);
+
+  display.print("Available: ");
+
+  display.print(availableSlots);
+
+
+  // ==========================================================
+  // GATE STATUS
+  // ==========================================================
+
+  display.setCursor(0, 56);
+
+  if (vehicleEntering &&
+      availableSlots > 0) {
+
+    display.print("IN: GATE OPEN");
+
+  }
+
+  else if (vehicleExiting) {
+
+    display.print("OUT: GATE OPEN");
+
+  }
+
+  else if (availableSlots == 0 &&
+           !gateIsOpen) {
+
+    display.print("PARKING FULL");
+
+  }
+
+  else if (gateIsOpen) {
+
+    display.print("GATE: OPEN");
+
+  }
+
+  else {
+
+    display.print("GATE: CLOSED");
+  }
+
+
+  display.display();
+}
+// ============================================================
+// ADD VEHICLE HISTORY
+// ============================================================
+
+void addHistory(String type, String slot) {
+
+  // Shift older records down
+
+  if (historyCount < MAX_HISTORY) {
+
+    historyCount++;
+
+  }
+
+  for (int i = historyCount - 1; i > 0; i--) {
+
+    history[i] = history[i - 1];
+
+  }
+
+
+  // ==========================================================
+  // GENERATE VEHICLE ID
+  // ==========================================================
+
+  String vehicleID = "VH-";
+
+  if (vehicleNumber < 10) {
+
+    vehicleID += "00";
+
+  }
+
+  else if (vehicleNumber < 100) {
+
+    vehicleID += "0";
+
+  }
+
+  vehicleID += String(vehicleNumber);
+
+
+  vehicleNumber++;
+
+  if (vehicleNumber > 999) {
+
+    vehicleNumber = 1;
+
+  }
+
+
+  // ==========================================================
+  // CURRENT DATE AND TIME
+  // ==========================================================
+
+  String currentDate =
+    getCurrentDate();
+
+  String currentTime =
+    getCurrentTime();
+
+
+  // ==========================================================
+  // SAVE RECORD
+  // ==========================================================
+
+  history[0].vehicleID =
+    vehicleID;
+
+  history[0].type =
+    type;
+
+  history[0].date =
+    currentDate;
+
+  history[0].time =
+    currentTime;
+
+  history[0].slot =
+    slot;
+
+  history[0].duration =
+    "--";
+
+
+  // ==========================================================
+  // SERIAL OUTPUT
+  // ==========================================================
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       VEHICLE HISTORY");
+  Serial.println("================================");
+
+  Serial.print("Vehicle ID: ");
+  Serial.println(vehicleID);
+
+  Serial.print("Type: ");
+  Serial.println(type);
+
+  Serial.print("Date: ");
+  Serial.println(currentDate);
+
+  Serial.print("Time: ");
+  Serial.println(currentTime);
+
+  Serial.print("Slot: ");
+  Serial.println(slot);
+
+  Serial.println("================================");
+}
+
+
+// ============================================================
+// FIND AVAILABLE PARKING SLOT
+// ============================================================
+
+String getAvailableSlot() {
+
+  if (!slot1Occupied) {
+
+    return "S1";
+
+  }
+
+  if (!slot2Occupied) {
+
+    return "S2";
+
+  }
+
+  if (!slot3Occupied) {
+
+    return "S3";
+
+  }
+
+  if (!slot4Occupied) {
+
+    return "S4";
+
+  }
+
+  return "--";
+}
+
+
+// ============================================================
+// FIND ACTIVE VEHICLE IN SLOT
+// ============================================================
+
+int findActiveVehicle(String slot) {
+
+  for (int i = 0; i < 4; i++) {
+
+    if (
+      activeVehicles[i].active &&
+      activeVehicles[i].slot == slot
+    ) {
+
+      return i;
+
+    }
+  }
+
+  return -1;
+}
+
+
+// ============================================================
+// REGISTER VEHICLE ENTRY
+// ============================================================
+
+void registerVehicleEntry(String slot) {
+
+  // Make sure the slot isn't already registered
+
+  if (findActiveVehicle(slot) != -1) {
+
+    return;
+  }
+
+
+  // Find an empty active-vehicle record
+
+  for (int i = 0; i < 4; i++) {
+
+    if (!activeVehicles[i].active) {
+
+      // Generate vehicle ID
+
+      String vehicleID = "VH-";
+
+      if (vehicleNumber < 10) {
+
+        vehicleID += "00";
+
+      }
+
+      else if (vehicleNumber < 100) {
+
+        vehicleID += "0";
+
+      }
+
+      vehicleID += String(vehicleNumber);
+
+
+      vehicleNumber++;
+
+      if (vehicleNumber > 999) {
+
+        vehicleNumber = 1;
+
+      }
+
+
+      // Save active vehicle
+
+      activeVehicles[i].vehicleID =
+        vehicleID;
+
+      activeVehicles[i].slot =
+        slot;
+
+      activeVehicles[i].entryMillis =
+        millis();
+
+      activeVehicles[i].active =
+        true;
+
+
+      // Add history
+
+      addHistory(
+        "ENTRY",
+        slot
+      );
+
+
+      // Keep the same ID in history
+
+      history[0].vehicleID =
+        vehicleID;
+
+
+      Serial.println();
+      Serial.println("VEHICLE ENTERED");
+
+      Serial.print("Vehicle: ");
+      Serial.println(vehicleID);
+
+      Serial.print("Slot: ");
+      Serial.println(slot);
+
+      Serial.print("Entry: ");
+      Serial.println(getCurrentTime());
+
+      return;
+    }
+  }
+}
+
+
+// ============================================================
+// REGISTER VEHICLE EXIT
+// ============================================================
+
+void registerVehicleExit() {
+
+  int selectedVehicle = -1;
+
+  unsigned long oldestEntry =
+    ULONG_MAX;
+
+
+  // Find the oldest active vehicle
+
+  for (int i = 0; i < 4; i++) {
+
+    if (activeVehicles[i].active) {
+
+      if (
+        activeVehicles[i].entryMillis <
+        oldestEntry
+      ) {
+
+        oldestEntry =
+          activeVehicles[i].entryMillis;
+
+        selectedVehicle =
+          i;
+      }
+    }
+  }
+
+
+  // No registered vehicle
+
+  if (selectedVehicle == -1) {
+
+    addHistory(
+      "EXIT",
+      "--"
+    );
+
+    return;
+  }
+
+
+  String vehicleID =
+    activeVehicles[selectedVehicle].vehicleID;
+
+  String slot =
+    activeVehicles[selectedVehicle].slot;
+
+
+  // ==========================================================
+  // CALCULATE PARKING DURATION
+  // ==========================================================
+
+  unsigned long durationMillis =
+    millis() -
+    activeVehicles[selectedVehicle].entryMillis;
+
+
+  unsigned long durationMinutes =
+    durationMillis / 60000;
+
+
+  String duration =
+    String(durationMinutes) +
+    " min";
+
+
+  // ==========================================================
+  // ADD EXIT HISTORY
+  // ==========================================================
+
+  addHistory(
+    "EXIT",
+    slot
+  );
+
+
+  history[0].vehicleID =
+    vehicleID;
+
+  history[0].duration =
+    duration;
+
+
+  // Remove vehicle from active list
+
+  activeVehicles[selectedVehicle].active =
+    false;
+
+
+  Serial.println();
+  Serial.println("VEHICLE EXITED");
+
+  Serial.print("Vehicle: ");
+  Serial.println(vehicleID);
+
+  Serial.print("Slot: ");
+  Serial.println(slot);
+
+  Serial.print("Exit: ");
+  Serial.println(getCurrentTime());
+
+  Serial.print("Duration: ");
+  Serial.println(duration);
+}
+// ============================================================
+// PROCESS VEHICLE ENTRY / EXIT EVENTS
+// ============================================================
+
+void processVehicleEvents() {
+
+  // ==========================================================
+  // ENTRY EVENT
+  // ==========================================================
+
+  if (
+    vehicleEntering &&
+    !previousEntryState &&
+    availableSlots > 0
+  ) {
+
+    String selectedSlot =
+      getAvailableSlot();
+
+    if (selectedSlot != "--") {
+
+      registerVehicleEntry(
+        selectedSlot
+      );
+
+      Serial.println(
+        "ENTRY EVENT REGISTERED"
+      );
+    }
+  }
+
+
+  // ==========================================================
+  // EXIT EVENT
+  // ==========================================================
+
+  if (
+    vehicleExiting &&
+    !previousExitState
+  ) {
+
+    registerVehicleExit();
+
+    Serial.println(
+      "EXIT EVENT REGISTERED"
+    );
+  }
+
+
+  // ==========================================================
+  // SAVE CURRENT SENSOR STATES
+  // ==========================================================
+
+  previousEntryState =
+    vehicleEntering;
+
+  previousExitState =
+    vehicleExiting;
+}
+// ============================================================
+// HISTORY JSON
+// ============================================================
+
+String getHistoryJSON() {
+
+  String json = "[";
+
+  for (int i = 0; i < historyCount; i++) {
+
+    if (i > 0) {
+      json += ",";
+    }
+
+    json += "{";
+
+    json += "\"id\":\"";
+    json += history[i].vehicleID;
+    json += "\",";
+
+    json += "\"type\":\"";
+    json += history[i].type;
+    json += "\",";
+
+    json += "\"date\":\"";
+    json += history[i].date;
+    json += "\",";
+
+    json += "\"time\":\"";
+    json += history[i].time;
+    json += "\",";
+
+    json += "\"slot\":\"";
+    json += history[i].slot;
+    json += "\",";
+
+    json += "\"duration\":\"";
+    json += history[i].duration;
+
+    json += "\"";
+    json += "}";
+  }
+
+  json += "]";
+
+  return json;
+}
+
+
+// ============================================================
+// LIVE STATUS API
+// ============================================================
+
+void handleStatus() {
+
+  String json = "{";
+
+
+  // ==========================================================
+  // PARKING SLOTS
+  // ==========================================================
+
+  json += "\"slot1\":";
+  json += slot1Occupied ? "true" : "false";
+  json += ",";
+
+  json += "\"slot2\":";
+  json += slot2Occupied ? "true" : "false";
+  json += ",";
+
+  json += "\"slot3\":";
+  json += slot3Occupied ? "true" : "false";
+  json += ",";
+
+  json += "\"slot4\":";
+  json += slot4Occupied ? "true" : "false";
+  json += ",";
+
+
+  // ==========================================================
+  // PARKING COUNTS
+  // ==========================================================
+
+  json += "\"occupied\":";
+  json += String(occupiedSlots);
+  json += ",";
+
+  json += "\"available\":";
+  json += String(availableSlots);
+  json += ",";
+
+
+  // ==========================================================
+  // GATE
+  // ==========================================================
+
+  json += "\"gate\":";
+  json += gateIsOpen ? "true" : "false";
+  json += ",";
+
+
+  // ==========================================================
+  // ENTRY SENSOR
+  // ==========================================================
+
+  json += "\"entry\":";
+  json += vehicleEntering ? "true" : "false";
+  json += ",";
+
+
+  // ==========================================================
+  // EXIT SENSOR
+  // ==========================================================
+
+  json += "\"exit\":";
+  json += vehicleExiting ? "true" : "false";
+  json += ",";
+
+
+  // ==========================================================
+  // CURRENT DATE
+  // ==========================================================
+
+  json += "\"date\":\"";
+  json += getCurrentDate();
+  json += "\",";
+  
+
+  // ==========================================================
+  // CURRENT TIME
+  // ==========================================================
+
+  json += "\"time\":\"";
+  json += getCurrentTime();
+  json += "\",";
+
+
+  // ==========================================================
+  // VEHICLE HISTORY
+  // ==========================================================
+
+  json += "\"history\":";
+  json += getHistoryJSON();
+
+
+  // ==========================================================
+  // CLOSE JSON
+  // ==========================================================
+
+  json += "}";
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+// ============================================================
+// PROFESSIONAL WEB DASHBOARD
+// ============================================================
+
+const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+
+<title>Smart Parking Management System</title>
+
+<style>
+
+/* ============================================================
+   GLOBAL
+   ============================================================ */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+
+  font-family:
+    Arial,
+    Helvetica,
+    sans-serif;
+
+  background: #0b1120;
+
+  color: #ffffff;
+
+  min-height: 100vh;
+
+  padding: 20px;
+}
+
+.container {
+
+  max-width: 1100px;
+
+  margin: auto;
+}
+
+
+/* ============================================================
+   HEADER
+   ============================================================ */
+
+.header {
+
+  display: flex;
+
+  justify-content: space-between;
+
+  align-items: center;
+
+  background: #111827;
+
+  border: 1px solid #1f2937;
+
+  border-radius: 18px;
+
+  padding: 20px;
+
+  margin-bottom: 20px;
+}
+
+.header h1 {
+
+  font-size: 26px;
+
+  margin-bottom: 5px;
+}
+
+.header p {
+
+  color: #9ca3af;
+
+  font-size: 13px;
+}
+
+.header-right {
+
+  text-align: right;
+}
+
+.online {
+
+  color: #22c55e;
+
+  font-size: 13px;
+
+  font-weight: bold;
+}
+
+.online-dot {
+
+  display: inline-block;
+
+  width: 10px;
+
+  height: 10px;
+
+  background: #22c55e;
+
+  border-radius: 50%;
+
+  margin-right: 6px;
+
+  box-shadow:
+    0 0 10px #22c55e;
+}
+
+.datetime {
+
+  margin-top: 8px;
+}
+
+.datetime-date {
+
+  color: #9ca3af;
+
+  font-size: 12px;
+
+  margin-bottom: 3px;
+}
+
+.datetime-time {
+
+  color: #ffffff;
+
+  font-size: 20px;
+
+  font-weight: bold;
+}
+
+
+/* ============================================================
+   SUMMARY CARDS
+   ============================================================ */
+
+.summary {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(3, 1fr);
+
+  gap: 15px;
+
+  margin-bottom: 25px;
+}
+
+.summary-card {
+
+  background: #111827;
+
+  border: 1px solid #1f2937;
+
+  border-radius: 16px;
+
+  padding: 20px;
+}
+
+.summary-title {
+
+  color: #9ca3af;
+
+  font-size: 13px;
+
+  margin-bottom: 8px;
+}
+
+.summary-value {
+
+  font-size: 30px;
+
+  font-weight: bold;
+}
+
+
+/* ============================================================
+   SECTION TITLE
+   ============================================================ */
+
+.section-title {
+
+  font-size: 18px;
+
+  margin-bottom: 15px;
+}
+
+
+/* ============================================================
+   PARKING SLOTS
+   ============================================================ */
+
+.slots {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(4, 1fr);
+
+  gap: 15px;
+
+  margin-bottom: 20px;
+}
+
+.slot {
+
+  background: #111827;
+
+  border: 1px solid #1f2937;
+
+  border-radius: 18px;
+
+  padding: 22px;
+
+  transition: 0.25s;
+}
+
+.slot:hover {
+
+  transform: translateY(-3px);
+}
+
+.slot-number {
+
+  color: #9ca3af;
+
+  font-size: 13px;
+
+  margin-bottom: 12px;
+}
+
+.slot-status {
+
+  font-size: 19px;
+
+  font-weight: bold;
+}
+
+.status-dot {
+
+  display: inline-block;
+
+  width: 12px;
+
+  height: 12px;
+
+  border-radius: 50%;
+
+  margin-right: 7px;
+}
+
+
+/* FREE */
+
+.free {
+
+  border-color: #14532d;
+}
+
+.free .status-dot {
+
+  background: #22c55e;
+
+  box-shadow:
+    0 0 10px #22c55e;
+}
+
+.free .slot-status {
+
+  color: #22c55e;
+}
+
+
+/* OCCUPIED */
+
+.occupied {
+
+  border-color: #7f1d1d;
+}
+
+.occupied .status-dot {
+
+  background: #ef4444;
+
+  box-shadow:
+    0 0 10px #ef4444;
+}
+
+.occupied .slot-status {
+
+  color: #ef4444;
+}
+
+
+/* ============================================================
+   STATUS SECTION
+   ============================================================ */
+
+.status-section {
+
+  display: grid;
+
+  grid-template-columns:
+    1fr 1fr;
+
+  gap: 15px;
+
+  margin-bottom: 20px;
+}
+
+.status-card {
+
+  background: #111827;
+
+  border: 1px solid #1f2937;
+
+  border-radius: 18px;
+
+  padding: 22px;
+}
+
+.status-card h3 {
+
+  font-size: 16px;
+
+  margin-bottom: 15px;
+}
+
+.status-row {
+
+  display: flex;
+
+  justify-content: space-between;
+
+  padding: 11px 0;
+
+  border-bottom:
+    1px solid #1f2937;
+}
+
+.status-row:last-child {
+
+  border-bottom: none;
+}
+
+.status-label {
+
+  color: #9ca3af;
+}
+
+.status-value {
+
+  font-weight: bold;
+}
+
+
+/* ============================================================
+   PROGRESS BAR
+   ============================================================ */
+
+.progress-container {
+
+  margin-top: 15px;
+}
+
+.progress-bar {
+
+  width: 100%;
+
+  height: 10px;
+
+  background: #1f2937;
+
+  border-radius: 10px;
+
+  overflow: hidden;
+}
+
+.progress {
+
+  height: 100%;
+
+  width: 0%;
+
+  background: #22c55e;
+
+  transition: width 0.4s;
+}
+
+
+/* ============================================================
+   HISTORY
+   ============================================================ */
+
+.history-section {
+
+  background: #111827;
+
+  border: 1px solid #1f2937;
+
+  border-radius: 18px;
+
+  padding: 22px;
+
+  margin-top: 20px;
+
+  overflow-x: auto;
+}
+
+.history-header {
+
+  display: flex;
+
+  justify-content: space-between;
+
+  align-items: center;
+
+  margin-bottom: 18px;
+}
+
+.history-header h2 {
+
+  font-size: 18px;
+}
+
+.history-header span {
+
+  color: #9ca3af;
+
+  font-size: 12px;
+}
+
+.history-table {
+
+  width: 100%;
+
+  border-collapse: collapse;
+
+  min-width: 700px;
+}
+
+.history-table th {
+
+  text-align: left;
+
+  color: #9ca3af;
+
+  font-size: 12px;
+
+  font-weight: normal;
+
+  padding: 12px;
+
+  border-bottom:
+    1px solid #1f2937;
+}
+
+.history-table td {
+
+  padding: 13px 12px;
+
+  font-size: 13px;
+
+  border-bottom:
+    1px solid #1f2937;
+}
+
+.vehicle-id {
+
+  font-weight: bold;
+}
+
+.entry-badge {
+
+  display: inline-block;
+
+  padding: 5px 10px;
+
+  border-radius: 20px;
+
+  background: #052e16;
+
+  color: #22c55e;
+
+  font-size: 11px;
+
+  font-weight: bold;
+}
+
+.exit-badge {
+
+  display: inline-block;
+
+  padding: 5px 10px;
+
+  border-radius: 20px;
+
+  background: #172554;
+
+  color: #60a5fa;
+
+  font-size: 11px;
+
+  font-weight: bold;
+}
+
+
+/* ============================================================
+   FOOTER
+   ============================================================ */
+
+.footer {
+
+  text-align: center;
+
+  color: #6b7280;
+
+  font-size: 12px;
+
+  margin-top: 25px;
+
+  padding-bottom: 10px;
+}
+
+
+/* ============================================================
+   MOBILE
+   ============================================================ */
+
+@media (max-width: 750px) {
+
+  .summary {
+
+    grid-template-columns: 1fr;
+  }
+
+  .slots {
+
+    grid-template-columns:
+      repeat(2, 1fr);
+  }
+
+  .status-section {
+
+    grid-template-columns: 1fr;
+  }
+
+  .header {
+
+    flex-direction: column;
+
+    align-items: flex-start;
+
+    gap: 15px;
+  }
+
+  .header-right {
+
+    text-align: left;
+  }
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<div class="container">
+
+
+<!-- ==========================================================
+     HEADER
+     ========================================================== -->
+
+<div class="header">
+
+  <div>
+
+    <h1>Smart Parking</h1>
+
+    <p>
+      ESP32 Parking Management System
+    </p>
+
+  </div>
+
+
+  <div class="header-right">
+
+    <div class="online">
+
+      <span class="online-dot"></span>
+
+      ESP32 ONLINE
+
+    </div>
+
+
+    <div class="datetime">
+
+      <div
+        class="datetime-date"
+        id="currentDate">
+
+        --/--/----
+
+      </div>
+
+
+      <div
+        class="datetime-time"
+        id="currentTime">
+
+        --:--:--
+
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+
+
+<!-- ==========================================================
+     SUMMARY
+     ========================================================== -->
+
+<div class="summary">
+
+
+  <div class="summary-card">
+
+    <div class="summary-title">
+
+      Available Slots
+
+    </div>
+
+    <div
+      class="summary-value"
+      id="available">
+
+      4 / 4
+
+    </div>
+
+  </div>
+
+
+  <div class="summary-card">
+
+    <div class="summary-title">
+
+      Occupied Slots
+
+    </div>
+
+    <div
+      class="summary-value"
+      id="occupied">
+
+      0
+
+    </div>
+
+  </div>
+
+
+  <div class="summary-card">
+
+    <div class="summary-title">
+
+      Occupancy
+
+    </div>
+
+    <div
+      class="summary-value"
+      id="occupancy">
+
+      0%
+
+    </div>
+
+  </div>
+
+</div>
+
+
+<!-- ==========================================================
+     PARKING SLOTS
+     ========================================================== -->
+
+<div class="section-title">
+
+  Parking Slots
+
+</div>
+
+
+<div class="slots">
+
+
+  <div
+    class="slot free"
+    id="slot1">
+
+    <div class="slot-number">
+
+      PARKING SLOT 01
+
+    </div>
+
+    <div class="slot-status">
+
+      <span class="status-dot"></span>
+
+      <span id="slot1Text">
+
+        FREE
+
+      </span>
+
+    </div>
+
+  </div>
+
+
+  <div
+    class="slot free"
+    id="slot2">
+
+    <div class="slot-number">
+
+      PARKING SLOT 02
+
+    </div>
+
+    <div class="slot-status">
+
+      <span class="status-dot"></span>
+
+      <span id="slot2Text">
+
+        FREE
+
+      </span>
+
+    </div>
+
+  </div>
+
+
+  <div
+    class="slot free"
+    id="slot3">
+
+    <div class="slot-number">
+
+      PARKING SLOT 03
+
+    </div>
+
+    <div class="slot-status">
+
+      <span class="status-dot"></span>
+
+      <span id="slot3Text">
+
+        FREE
+
+      </span>
+
+    </div>
+
+  </div>
+
+
+  <div
+    class="slot free"
+    id="slot4">
+
+    <div class="slot-number">
+
+      PARKING SLOT 04
+
+    </div>
+
+    <div class="slot-status">
+
+      <span class="status-dot"></span>
+
+      <span id="slot4Text">
+
+        FREE
+
+      </span>
+
+    </div>
+
+  </div>
+
+</div>
+
+
+<!-- ==========================================================
+     STATUS
+     ========================================================== -->
+
+<div class="status-section">
+
+
+  <!-- GATE STATUS -->
+
+  <div class="status-card">
+
+    <h3>
+
+      Gate Status
+
+    </h3>
+
+
+    <div class="status-row">
+
+      <span class="status-label">
+
+        Gate
+
+      </span>
+
+      <span
+        class="status-value"
+        id="gateStatus">
+
+        CLOSED
+
+      </span>
+
+    </div>
+
+
+    <div class="status-row">
+
+      <span class="status-label">
+
+        Entry
+
+      </span>
+
+      <span
+        class="status-value"
+        id="entryStatus">
+
+        READY
+
+      </span>
+
+    </div>
+
+
+    <div class="status-row">
+
+      <span class="status-label">
+
+        Exit
+
+      </span>
+
+      <span
+        class="status-value"
+        id="exitStatus">
+
+        READY
+
+      </span>
+
+    </div>
+
+  </div>
+
+
+  <!-- CAPACITY -->
+
+  <div class="status-card">
+
+    <h3>
+
+      Parking Capacity
+
+    </h3>
+
+
+    <div class="status-row">
+
+      <span class="status-label">
+
+        Total Capacity
+
+      </span>
+
+      <span class="status-value">
+
+        4 Vehicles
+
+      </span>
+
+    </div>
+
+
+    <div class="status-row">
+
+      <span class="status-label">
+
+        Occupied
+
+      </span>
+
+      <span
+        class="status-value"
+        id="capacityOccupied">
+
+        0
+
+      </span>
+
+    </div>
+
+
+    <div class="status-row">
+
+      <span class="status-label">
+
+        Available
+
+      </span>
+
+      <span
+        class="status-value"
+        id="capacityAvailable">
+
+        4
+
+      </span>
+
+    </div>
+
+
+    <div class="progress-container">
+
+      <div class="progress-bar">
+
+        <div
+          class="progress"
+          id="progress">
+
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+
+
+<!-- ==========================================================
+     VEHICLE HISTORY
+     ========================================================== -->
+
+<div class="history-section">
+
+
+  <div class="history-header">
+
+    <h2>
+
+      Recent Vehicle History
+
+    </h2>
+
+
+    <span>
+
+      Live Activity Log
+
+    </span>
+
+  </div>
+
+
+  <table class="history-table">
+
+
+    <thead>
+
+      <tr>
+
+        <th>
+          Vehicle ID
+        </th>
+
+        <th>
+          Type
+        </th>
+
+        <th>
+          Date
+        </th>
+
+        <th>
+          Time
+        </th>
+
+        <th>
+          Slot
+        </th>
+
+        <th>
+          Duration
+        </th>
+
+      </tr>
+
+    </thead>
+
+
+    <tbody id="historyBody">
+
+    </tbody>
+
+
+  </table>
+
+</div>
+
+
+<!-- ==========================================================
+     FOOTER
+     ========================================================== -->
+
+<div class="footer">
+
+  Smart Parking Management System | ESP32
+
+</div>
+
+
+</div>
+// ============================================================
+// DASHBOARD JAVASCRIPT
+// ============================================================
+
+<script>
+
+// ============================================================
+// UPDATE DATE AND TIME
+// ============================================================
+
+function updateDateTime(data) {
+
+  const dateElement =
+    document.getElementById("currentDate");
+
+  const timeElement =
+    document.getElementById("currentTime");
+
+
+  if (dateElement) {
+
+    dateElement.innerText =
+      data.date;
+  }
+
+
+  if (timeElement) {
+
+    timeElement.innerText =
+      data.time;
+  }
+}
+
+
+// ============================================================
+// UPDATE PARKING SLOT
+// ============================================================
+
+function updateSlot(number, occupied) {
+
+  const card =
+    document.getElementById(
+      "slot" + number
+    );
+
+  const text =
+    document.getElementById(
+      "slot" + number + "Text"
+    );
+
+
+  if (occupied) {
+
+    card.classList.remove("free");
+
+    card.classList.add("occupied");
+
+    text.innerText =
+      "OCCUPIED";
+
+  }
+
+  else {
+
+    card.classList.remove("occupied");
+
+    card.classList.add("free");
+
+    text.innerText =
+      "FREE";
+  }
+}
+
+
+// ============================================================
+// UPDATE VEHICLE HISTORY
+// ============================================================
+
+function updateHistory(history) {
+
+  const historyBody =
+    document.getElementById(
+      "historyBody"
+    );
+
+
+  historyBody.innerHTML = "";
+
+
+  // No history
+
+  if (
+    !history ||
+    history.length === 0
+  ) {
+
+    historyBody.innerHTML = `
+
+      <tr>
+
+        <td
+          colspan="6"
+          style="
+            text-align:center;
+            color:#9ca3af;
+          "
+        >
+
+          No vehicle activity yet
+
+        </td>
+
+      </tr>
+
+    `;
+
+    return;
+  }
+
+
+  // Display records
+
+  history.forEach(
+    function(vehicle) {
+
+      const row =
+        document.createElement("tr");
+
+
+      const badgeClass =
+        vehicle.type === "ENTRY"
+        ? "entry-badge"
+        : "exit-badge";
+
+
+      row.innerHTML = `
+
+        <td>
+
+          <span class="vehicle-id">
+
+            ${vehicle.id}
+
+          </span>
+
+        </td>
+
+
+        <td>
+
+          <span class="${badgeClass}">
+
+            ${vehicle.type}
+
+          </span>
+
+        </td>
+
+
+        <td>
+
+          ${vehicle.date}
+
+        </td>
+
+
+        <td>
+
+          ${vehicle.time}
+
+        </td>
+
+
+        <td>
+
+          ${vehicle.slot}
+
+        </td>
+
+
+        <td>
+
+          ${vehicle.duration}
+
+        </td>
+
+      `;
+
+
+      historyBody.appendChild(row);
+
+    }
+  );
+}
+
+
+// ============================================================
+// UPDATE COMPLETE DASHBOARD
+// ============================================================
+
+async function updateDashboard() {
+
+  try {
+
+    const response =
+      await fetch("/api/status");
+
+
+    const data =
+      await response.json();
+
+
+    // ========================================================
+    // DATE AND TIME
+    // ========================================================
+
+    updateDateTime(data);
+
+
+    // ========================================================
+    // PARKING SLOTS
+    // ========================================================
+
+    updateSlot(
+      1,
+      data.slot1
+    );
+
+    updateSlot(
+      2,
+      data.slot2
+    );
+
+    updateSlot(
+      3,
+      data.slot3
+    );
+
+    updateSlot(
+      4,
+      data.slot4
+    );
+
+
+    // ========================================================
+    // AVAILABLE SLOTS
+    // ========================================================
+
+    document.getElementById(
+      "available"
+    ).innerText =
+      data.available + " / 4";
+
+
+    // ========================================================
+    // OCCUPIED SLOTS
+    // ========================================================
+
+    document.getElementById(
+      "occupied"
+    ).innerText =
+      data.occupied;
+
+
+    // ========================================================
+    // OCCUPANCY PERCENTAGE
+    // ========================================================
+
+    const percentage =
+      Math.round(
+        (data.occupied / 4) * 100
+      );
+
+
+    document.getElementById(
+      "occupancy"
+    ).innerText =
+      percentage + "%";
+
+
+    // ========================================================
+    // CAPACITY
+    // ========================================================
+
+    document.getElementById(
+      "capacityOccupied"
+    ).innerText =
+      data.occupied;
+
+
+    document.getElementById(
+      "capacityAvailable"
+    ).innerText =
+      data.available;
+
+
+    // ========================================================
+    // PROGRESS BAR
+    // ========================================================
+
+    document.getElementById(
+      "progress"
+    ).style.width =
+      percentage + "%";
+
+
+    // ========================================================
+    // GATE STATUS
+    // ========================================================
+
+    document.getElementById(
+      "gateStatus"
+    ).innerText =
+      data.gate
+      ? "OPEN"
+      : "CLOSED";
+
+
+    // ========================================================
+    // ENTRY STATUS
+    // ========================================================
+
+    document.getElementById(
+      "entryStatus"
+    ).innerText =
+      data.entry
+      ? "VEHICLE DETECTED"
+      : "READY";
+
+
+    // ========================================================
+    // EXIT STATUS
+    // ========================================================
+
+    document.getElementById(
+      "exitStatus"
+    ).innerText =
+      data.exit
+      ? "VEHICLE DETECTED"
+      : "READY";
+
+
+    // ========================================================
+    // VEHICLE HISTORY
+    // ========================================================
+
+    updateHistory(
+      data.history
+    );
+
+  }
+
+
+  catch (error) {
+
+    console.log(
+      "ESP32 connection error:",
+      error
+    );
+
+  }
+}
+
+
+// ============================================================
+// FIRST UPDATE
+// ============================================================
+
+updateDashboard();
+
+
+// ============================================================
+// AUTOMATIC LIVE UPDATE
+// ============================================================
+
+setInterval(
+  updateDashboard,
+  500
+);
+
+</script>
+
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+// ============================================================
+// DASHBOARD ROUTE
+// ============================================================
+
+void handleDashboard() {
+
+  server.send(
+    200,
+    "text/html",
+    DASHBOARD_HTML
+  );
+}
+// ============================================================
+// SERIAL SYSTEM STATUS
+// ============================================================
+
+void printSystemStatus() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("      SMART PARKING STATUS");
+  Serial.println("================================");
+
+  Serial.print("Slot 1: ");
+  Serial.println(
+    slot1Occupied
+    ? "OCCUPIED"
+    : "FREE"
+  );
+
+  Serial.print("Slot 2: ");
+  Serial.println(
+    slot2Occupied
+    ? "OCCUPIED"
+    : "FREE"
+  );
+
+  Serial.print("Slot 3: ");
+  Serial.println(
+    slot3Occupied
+    ? "OCCUPIED"
+    : "FREE"
+  );
+
+  Serial.print("Slot 4: ");
+  Serial.println(
+    slot4Occupied
+    ? "OCCUPIED"
+    : "FREE"
+  );
+
+  Serial.println("--------------------------------");
+
+  Serial.print("Occupied Slots: ");
+  Serial.println(occupiedSlots);
+
+  Serial.print("Available Slots: ");
+  Serial.println(availableSlots);
+
+  Serial.println("--------------------------------");
+
+  Serial.print("Entry Sensor: ");
+
+  Serial.println(
+    vehicleEntering
+    ? "VEHICLE DETECTED"
+    : "CLEAR"
+  );
+
+  Serial.print("Exit Sensor: ");
+
+  Serial.println(
+    vehicleExiting
+    ? "VEHICLE DETECTED"
+    : "CLEAR"
+  );
+
+  Serial.print("Gate: ");
+
+  Serial.println(
+    gateIsOpen
+    ? "OPEN"
+    : "CLOSED"
+  );
+
+  Serial.print("Date: ");
+  Serial.println(
+    getCurrentDate()
+  );
+
+  Serial.print("Time: ");
+  Serial.println(
+    getCurrentTime()
+  );
+
+  Serial.println("================================");
+}
